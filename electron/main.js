@@ -144,6 +144,7 @@ const titlesLib = require('./titles');
 const { createSkills } = require('./skills');
 const { createAgents, toolNames } = require('./subagents');
 const { createTeams } = require('./teams');
+const { createCliAgents, kindOf: cliKind, modelOf: cliModel, claudeAsk, KINDS: CLI_KINDS } = require('./cli-agents');
 const { createMake, ZONES: MAKE_ZONES, cleanZone: cleanMakeZone, validZone: validMakeZone } = require('./make');
 const chatSearch = require('./chatsearch');
 const { createScheduler } = require('./scheduler');
@@ -947,9 +948,70 @@ const teams = createTeams({
   log: (m) => logger.warn('teams', m),
   runTurn: runTeamTurn
 });
-/** One turn of one team member (or the lead): a sub-agent run with the member's tools plus the team's room tools.
- *  Files go to the Files folder; writes ask in the team room unless the team was set not to ask. */
-async function runTeamTurn({ agent, prompt, extraTools, signal, askWrites, onUsage, onApproval, onStep = () => {} }) {
+/** Asks the user in the team room (an approval card) and resolves with their answer; Stop declines what is still open. */
+function teamAsker(agent, onApproval, signal) {
+  const mine = new Set();
+  const declineAll = () => { for (const id of mine) decideTool(id, false); };
+  signal.addEventListener('abort', declineAll, { once: true });
+  const ask = (info) => new Promise((resolve) => {
+    const id = 'team-' + crypto.randomBytes(6).toString('hex');
+    mine.add(id);
+    approvals.set(id, (ok) => { mine.delete(id); onApproval.done(id, ok); resolve(ok); });
+    approvalMeta.set(id, { name: info.name, category: info.category });
+    onApproval.asked({ id, summary: info.summary || info.name });
+    try { if (win && !win.isDestroyed() && !win.isFocused() && Notification.isSupported()) new Notification({ title: `${agent.name} needs your OK`, body: String(info.summary || info.name).slice(0, 180) }).show(); } catch {}
+  });
+  return { ask, done: () => { signal.removeEventListener('abort', declineAll); declineAll(); } };
+}
+
+// Claude Code / Codex members: the CLI runs on its own login; the team tools reach it over this local MCP server,
+// where each turn's token sees only that turn's tools (never Artemis's own MCP tools).
+const cliAgents = createCliAgents({ spawn: require('child_process').spawn, execFile: require('child_process').execFile, log: (m) => logger.warn('teams', m) });
+const teamSessions = new Map(); // token -> tools of one CLI turn
+let teamMcp = null;
+async function teamMcpUrl() {
+  if (!teamMcp) teamMcp = require('./mcp-server').createMcpServer({
+    sessions: (token) => teamSessions.get(token) || null, isLocked: () => lock.isLocked(),
+    info: { name: 'artemis-team', version: '1.0.0' },
+    instructions: 'Tools of the Artemis agent team you work in: post to the team room, ask a teammate, finish your task, review a teammate\'s work.',
+    log: (lvl, msg) => logger[lvl === 'warn' ? 'warn' : 'debug']('teams', msg)
+  });
+  if (!teamMcp.running()) await teamMcp.start(0);
+  return `http://127.0.0.1:${teamMcp.port()}/mcp`;
+}
+async function runCliTurn(kind, { agent, prompt, extraTools, signal, askWrites, onUsage, onApproval, onStep, folder }) {
+  const token = crypto.randomBytes(24).toString('hex');
+  const asker = teamAsker(agent, onApproval, signal);
+  const tools = extraTools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.parameters, run: t.run }));
+  if (kind === 'claude') tools.push({
+    name: 'team_permission', description: 'Asks the user whether a tool call may run.',
+    inputSchema: { type: 'object', properties: { tool_name: { type: 'string' }, input: { type: 'object' }, tool_use_id: { type: 'string' } }, required: ['tool_name'] },
+    run: async (a) => {
+      const ok = await asker.ask({ name: a.tool_name, category: 'team', summary: claudeAsk(a.tool_name, a.input) });
+      return JSON.stringify(ok ? { behavior: 'allow', updatedInput: a.input || {} } : { behavior: 'deny', message: 'The user declined this. Carry on without it, or ask in the team room.' });
+    }
+  });
+  teamSessions.set(token, tools);
+  logger.info('teams', `${agent.name} started on ${CLI_KINDS[kind].label}`, { folder });
+  try {
+    const system = [agent.body, `You are ${agent.name}${agent.role ? `, the team's ${agent.role}` : ''}, in an Artemis agent team. Your team tools are in the "team" MCP server (team_post, team_ask, team_done, team_review or team_plan when offered). Finish by calling the team tool your task asks for.`].filter(Boolean).join('\n\n');
+    return await cliAgents.run({
+      kind, model: cliModel(agent.model), prompt, system, folder, askWrites, signal, mcp: { url: await teamMcpUrl(), token }, onStep,
+      onUsage: (u) => { // on a subscription there is no per-token price: tokens are recorded, cost stays 0
+        recordUsage({ t: Date.now(), model: CLI_KINDS[kind].label, chat: '', project: '', source: 'team', prompt: u.prompt, completion: u.completion, cached: u.cached || 0, cacheWrite: 0, estimated: false });
+        onUsage({ prompt: u.prompt, completion: u.completion, usd: 0 });
+      }
+    });
+  } finally { teamSessions.delete(token); asker.done(); }
+}
+
+/** One turn of one team member (or the lead): a sub-agent run with the member's tools plus the team's room tools,
+ *  or a Claude Code / Codex run for a member set to one of those. Files go to the team's folder (default: the Files folder);
+ *  writes ask in the team room unless the team was set not to ask. */
+async function runTeamTurn({ agent, prompt, extraTools, signal, askWrites, onUsage, onApproval, onStep = () => {}, folder: folder0 }) {
+  const folder = folder0 && fs.existsSync(folder0) ? folder0 : defaultFilesDir();
+  const cli = cliKind(agent.model);
+  if (cli) return runCliTurn(cli, { agent, prompt, extraTools, signal, askWrites, onUsage, onApproval, onStep, folder });
   const settings = getSettings();
   const lim = limitState();
   if (lim.blocked) throw new Error(lim.blocked);
@@ -960,14 +1022,12 @@ async function runTeamTurn({ agent, prompt, extraTools, signal, askWrites, onUsa
   if (route.error) throw new Error(route.error);
   const prices = providersLib.priceMap(readProviders());
   const steps = [''];
-  const mine = new Set();
-  const onAbort = () => { for (const id of mine) decideTool(id, false); };
-  signal.addEventListener('abort', onAbort, { once: true });
+  const asker = teamAsker(agent, onApproval, signal);
   logger.info('teams', `${agent.name} started`, { model });
   try {
     await runAgent({
       baseUrl: route.baseUrl, key: route.key, model: route.model, usageModel: model, noToolCalls: !!route.noTools, maxTokens: settings.maxTokens, isSub: true, toolsEnabled: true, userData: app.getPath('userData'),
-      messages: [{ role: 'user', content: prompt }], custom: '', project: null, root: defaultFilesDir(), defaultRoot: true,
+      messages: [{ role: 'user', content: prompt }], custom: '', project: null, root: folder, defaultRoot: folder === defaultFilesDir(),
       webEnabled: settings.webEnabled, shellEnabled: false, computer: null, phone: null, media: null, mcp: null, memoryEnabled: false, memoryApi: null, skills: null,
       chats: settings.chatSearchEnabled !== false ? chatsApi() : null, autoLearn: false, delegateEnabled: false,
       allowTools: toolNames(agent.tools || []), agentRole: agent.body || '', extraTools,
@@ -978,14 +1038,7 @@ async function runTeamTurn({ agent, prompt, extraTools, signal, askWrites, onUsa
         recordUsage(rec);
         onUsage({ prompt: rec.prompt, completion: rec.completion, usd: costOf(rec, prices) });
       },
-      approve: (info) => new Promise((resolve) => {
-        const id = 'team-' + Math.random().toString(36).slice(2, 10);
-        mine.add(id);
-        approvals.set(id, (ok) => { mine.delete(id); onApproval.done(id, ok); resolve(ok); });
-        approvalMeta.set(id, { name: info.name, category: info.category });
-        onApproval.asked({ id, summary: info.summary || info.name });
-        try { if (win && !win.isDestroyed() && !win.isFocused() && Notification.isSupported()) new Notification({ title: `${agent.name} needs your OK`, body: String(info.summary || info.name).slice(0, 180) }).show(); } catch {}
-      }),
+      approve: (info) => asker.ask(info),
       send: (ev) => {
         if (ev.type === 'chunk' && !ev.agent) { steps[steps.length - 1] += ev.text; onStep({ type: 'text', text: ev.text }); }
         else if (ev.type === 'step:new') { steps.push(''); onStep({ type: 'step' }); }
@@ -997,7 +1050,7 @@ async function runTeamTurn({ agent, prompt, extraTools, signal, askWrites, onUsa
       },
       signal
     });
-  } finally { signal.removeEventListener('abort', onAbort); }
+  } finally { asker.done(); }
   return steps.map(stripThinkText).filter((x) => x.trim()).pop() || '';
 }
 
@@ -2064,6 +2117,7 @@ app.on('before-quit', (e) => {
   }
   flushUsage();
   try { teams.flush(); } catch {}
+  try { teamMcp && teamMcp.stop(); } catch {}
   try { updater.installOnQuit(); } catch (e) { logger.warn('update', 'Install on quit failed: ' + e.message); }
   try { mcpServer.stop(); } catch {} try { sentinelWidget && sentinelWidget.destroy(); } catch {}
   // Every other window goes now: a hidden or always-on-top one must not keep the app alive.
@@ -2291,7 +2345,7 @@ require('./ipc/skills')({ ipcMain, app, dialog, shell, fs, path, skills, skillRo
 require('./ipc/themes')({ ipcMain, dialog, shell, fs, path, themes, themeDirs, listThemes, nativeThemeFor, broadcastTheme, getSettings, saveSettings, getWin: () => win });
 require('./ipc/brains')({ ipcMain, brains });
 require('./ipc/agents')({ ipcMain, agents, fs, shell, skillRoot });
-require('./ipc/teams')({ ipcMain, teams });
+require('./ipc/teams')({ ipcMain, teams, cliAgents });
 require('./ipc/logs')({ ipcMain, shell, fs, logger });
 // Memory diagnostics (Logs → Memory, Settings → General → Memory, command palette "Show memory use", and every 5 minutes from the window)
 {
