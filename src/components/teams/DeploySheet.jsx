@@ -22,7 +22,7 @@ export default function DeploySheet({ team, roster, chatGroups, onDone, onNewAge
   const [busy, setBusy] = useState(false);
   const [clis, setClis] = useState({ claude: false, codex: false });
   useEffect(() => { window.api.teamsClis?.().then((c) => c && setClis(c)).catch(() => {}); }, []);
-  // Claude Code and Codex run on this computer with their own login (a subscription or their own key)
+  // Claude Code and Codex run on this computer on the user's plan login (API-key variables are not passed on)
   const cliGroup = [clis.claude && [CLI_CLAUDE, 'Claude Code · your login'], clis.codex && [CLI_CODEX, 'Codex · your login']].filter(Boolean);
   const memberGroups = cliGroup.length ? [{ label: 'On this computer', items: cliGroup }, ...chatGroups] : chatGroups;
   const usesCodex = d.members.some((m) => m.model === CLI_CODEX);
