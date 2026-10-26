@@ -3,6 +3,7 @@ import Select from './Select.jsx';
 import { AttachmentChip } from './Message.jsx';
 import ModelPicker from './ModelPicker.jsx';
 import { Icon } from './Icons.jsx';
+import { ContextMenu } from './TabBar.jsx';
 import { filesToAttachments, onWindowDrop } from '../lib/attach.js';
 import { startRecording, transcribe, LANGS } from '../lib/voice.js';
 import { costOf, fmtUsd } from '../lib/cost.js';
@@ -126,7 +127,7 @@ function MicButton({ settings, onText, onVoiceSettings, onError }) {
 }
 
 /** The per-chat switches (project, brain, tools, agents, permissions) and the usage button. In the main chat they are stacked in the right bar (stacked), in a split pane they sit in its header. */
-export function ChatPills({ brains = [], brain, onBrain, councilPick, onRevote, tools, onTools, agents, onAgents, effort = 'auto', onEffort, perm, onPerm, projectId, projects = [], onProject, incognito, settings, chatId, model, onUsageDetails, onOpenSettings, stacked }) {
+export function ChatPills({ brains = [], brain, onBrain, councilPick, onRevote, tools, onTools, agents, onAgents, shell, onShell, effort = 'auto', onEffort, perm, onPerm, projectId, projects = [], onProject, incognito, settings, chatId, model, onUsageDetails, onOpenSettings, stacked }) {
   return (
     <div className={`top-pills nodrag ${stacked ? 'stacked' : ''}`}>
       {onBrain && brains.length > 0 && (
@@ -157,6 +158,12 @@ export function ChatPills({ brains = [], brain, onBrain, councilPick, onRevote, 
         <Select className={`pill-select agents ${agents === 'off' ? 'off' : ''}`} title="Agents in this chat: when on, Artemis can hand parts of the work to your agents (Researcher, Reviewer, …). Off keeps it to one assistant and saves tokens." value={agents} onChange={(e) => onAgents(e.target.value)}>
           <option value="on">Agents</option>
           <option value="off">No agents</option>
+        </Select>
+      )}
+      {onShell && settings && (settings.sandbox === 'docker' || settings.sandbox === 'ssh') && settings.shellEnabled !== false && (
+        <Select className={`pill-select shell ${shell === 'host' ? 'host' : ''}`} title={`Where terminal commands run in this chat. Sandbox: ${settings.sandbox === 'ssh' ? `on ${settings.sandboxSshHost || 'the SSH host'}` : 'in a Docker container that sees only the project folder'} (Settings → Tools & safety → Sandbox). This Mac: your real shell, asks once per task.`} value={shell === 'host' ? 'host' : 'sandbox'} onChange={(e) => onShell(e.target.value)}>
+          <option value="sandbox">Commands: sandbox</option>
+          <option value="host">Commands: this Mac</option>
         </Select>
       )}
       {onPerm && (
@@ -288,11 +295,22 @@ export default function Composer({ streaming, onSend, onStop, queue = [], queueH
     window.addEventListener('artemis:composer-fill', h);
     return () => window.removeEventListener('artemis:composer-fill', h);
   }, [chatId]);
-  const [focused, setFocused] = useState(false);
   const mac = typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform || '');
 
   useEffect(() => onWindowDrop((fl) => addFiles(fl)), []);
 
+  // the "+" menu: attach, the switches for this chat, and the project (Home and chats pass different handlers)
+  const [plus, setPlus] = useState(null);
+  const onOff = (v) => (v === 'off' ? 'Off' : 'On');
+  const plusItems = () => [
+    { label: 'Add files or photos…', onClick: () => pick() },
+    (onTools || onAgents || onPerm) && { sep: true },
+    onTools && { label: 'Tools', hint: onOff(tools), onClick: () => onTools(tools === 'off' ? 'on' : 'off') },
+    onAgents && { label: 'Helper agents', hint: onOff(agents), onClick: () => onAgents(agents === 'off' ? 'on' : 'off') },
+    onPerm && { label: 'Ask before acting', hint: perm === 'auto' ? 'Off' : 'On', onClick: () => onPerm(perm === 'auto' ? 'ask' : 'auto') },
+    ...(onProject && projects.length ? [{ sep: true }, { label: 'No project', hint: projectId ? '' : '✓', onClick: () => onProject(null) },
+      ...projects.slice(0, 8).map((pr) => ({ label: pr.name, hint: pr.id === projectId ? '✓' : '', onClick: () => onProject(pr.id) }))] : []),
+  ].filter(Boolean);
   const pick = async () => {
     const r = await window.api.pickFiles();
     if (r.length) setAtts((a) => [...a, ...r]);
@@ -408,8 +426,7 @@ export default function Composer({ streaming, onSend, onStop, queue = [], queueH
           placeholder={disabledReason || placeholder || 'Message Artemis…'}
           aria-label="Message"
           onChange={(e) => { setSlashOff(false); setText(e.target.value); }}
-          onFocus={() => setFocused(true)}
-          onBlur={() => { setSlashOff(true); setFocused(false); }}
+          onBlur={() => setSlashOff(true)}
           onPaste={onPaste}
           onKeyDown={(e) => {
             if (slashOpen && entries.length) {
@@ -430,10 +447,11 @@ export default function Composer({ streaming, onSend, onStop, queue = [], queueH
           }}
         />
         </div>
-        {focused && !text && <div className="kbd-hints" aria-hidden="true"><kbd>↵</kbd> send · <kbd>⇧↵</kbd> newline{streaming ? <> · <kbd>⌘↵</kbd> send now · <kbd>Esc</kbd> stop</> : null}</div>}
         {micErr && <div className="mic-err" onClick={() => setMicErr('')}>{micErr}</div>}
         <div className="composer-bar">
-          <button className="icon-btn" title="Attach any file. Text, code, Excel, CSV, Word, PDF, ZIP and images are read; other files (audio, video, apps) are passed with their name and location. You can also drag or paste files here." aria-label="Attach any file. Text, code, Excel, CSV, Word, PDF, ZIP and images are read; other files (audio, video, apps) are passed with their name and location. You can also drag or paste files here." onClick={pick}><Icon name="paperclip" size={18} /></button>
+          <button className={`icon-btn plus-btn ${plus ? 'open' : ''}`} title="Add files, a project or tools. You can also drag or paste files here." aria-label="Add files, a project or tools" aria-haspopup="menu" aria-expanded={!!plus}
+            onMouseDown={(e) => { if (plus) e.stopPropagation(); }} onClick={(e) => { if (plus) { setPlus(null); return; } const r = e.currentTarget.getBoundingClientRect(); const items = plusItems(); setPlus({ x: r.left, y: Math.max(8, r.top - 12 - items.length * 30), items }); }}><Icon name="plus" size={18} /></button>
+          <ContextMenu menu={plus} onClose={() => setPlus(null)} />
           <MicButton settings={settings} onVoiceSettings={() => onOpenSettings('voice')} onError={setMicErr}
             onText={(t) => { setMicErr(''); setText((x) => (x && !/\s$/.test(x) ? x + ' ' : x) + t); setTimeout(() => ta.current?.focus(), 0); }} />
           {onSentinel && <button className={`icon-btn sentinel-btn ${sentinel && sentinel !== 'off' ? 'on' : ''}`} title={sentinel && sentinel !== 'off' ? `Sentinel is on. Click to turn off${sKey}` : `Sentinel mode: say “${window.__wakeWord || 'Wake up'}” to talk hands-free${sKey}`} aria-label={sentinel && sentinel !== 'off' ? `Sentinel is on. Click to turn off${sKey}` : `Sentinel mode: say “${window.__wakeWord || 'Wake up'}” to talk hands-free${sKey}`} onClick={onSentinel}><Icon name="shield" size={17} /></button>}

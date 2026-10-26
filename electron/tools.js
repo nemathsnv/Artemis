@@ -27,6 +27,16 @@ function outlineOf(text, name) {
 
 const WRITE_TOOLS = new Set(['library_write', 'library_edit', 'library_delete', 'notes_write', 'notes_append', 'notes_edit', 'write_file', 'edit_file', 'write_spreadsheet', 'update_cells', 'move_file', 'delete_file']);
 const ALWAYS_ASK = new Set(['delete_file', 'library_delete']);
+// These change what Artemis does by itself later (an endpoint on the internet, a check that costs tokens): asked every time.
+/** A model as people write it in a prompt ("Claude Code", "codex") as the id Artemis uses; ids pass through. */
+const modelId = (m) => {
+  const v = String(m || '').trim();
+  if (!v || /^(prov|cli):/.test(v) || v === 'inherit') return v;
+  if (/claude[\s_-]*code|^claude$/i.test(v)) return 'cli:claude';
+  if (/codex/i.test(v)) return 'cli:codex';
+  return v;
+};
+const ASK_EACH_TIME = new Set(['hook_create', 'hook_delete', 'heartbeat_set', 'heartbeat_delete', 'agent_save', 'team_save', 'team_start', 'team_delete']);
 // Tools that need one approval per task (per run), by category
 // A model can get stuck saving, deleting and re-saving the same memory. Memory may change a few times per task, then it is refused.
 const MEMORY_CHANGES_PER_TASK = 4;
@@ -43,7 +53,7 @@ const fn = (name, description, properties, required = []) => ({
   function: { name, description, parameters: { type: 'object', properties, required } }
 });
 
-function definitions({ makeEnabled, hasFolder, memoryEnabled, webEnabled, shellEnabled, computerEnabled, phoneEnabled, scheduleEnabled, notesEnabled, termEnabled, mediaEnabled, skillsEnabled, learnEnabled, chatsEnabled, delegateEnabled, browserEnabled }) {
+function definitions({ teamsEnabled, makeEnabled, hasFolder, memoryEnabled, memorySearchEnabled, webEnabled, shellEnabled, computerEnabled, phoneEnabled, scheduleEnabled, notesEnabled, termEnabled, mediaEnabled, skillsEnabled, learnEnabled, chatsEnabled, delegateEnabled, browserEnabled }) {
   const defs = [];
   if (hasFolder) defs.push(fn('task_note', 'Keeps a short note about the current task (plan, what is done, what is left, key facts). Old tool output is cleared as a long run goes on, but this note is shown to you at every step. Replaces the note, or adds to it with append=true. Empty text clears it.', { text: { type: 'string' }, append: { type: 'boolean' } }, ['text']));
   defs.push(fn('create_artifact', 'Creates (or updates) an artifact: a standalone piece of content shown in a side panel next to the chat, e.g. a web page/app/game (html), a diagram or graphic (svg), a long document (markdown), a substantial code file (code) or an Excel/CSV table (spreadsheet). For any Excel/xlsx/xls/CSV request use type spreadsheet, never an html page with a fake download button. To change an existing artifact, call again with the same id and the full new content.', {
@@ -105,9 +115,25 @@ function definitions({ makeEnabled, hasFolder, memoryEnabled, webEnabled, shellE
   defs.push(fn('lock_app', 'Locks the Artemis app (the app lock from Settings → Security) right now. Use it when the user says "lock", "Artemis lock" or asks you to lock or secure the app. Needs no arguments and no approval. Only the user can unlock it again (password, Touch ID or their voice).', {}, []));
   if (memoryEnabled) {
     defs.push(
-      fn('memory_save', 'Saves a durable fact about the user to memory (preference, context, goal). Use when the user says "remember" or shares a lasting fact. Write one short sentence.', { text: { type: 'string' } }, ['text']),
+      fn('memory_save', memorySearchEnabled
+        ? 'Saves a lasting fact about the user to MEMORY.md (a preference, how they work, a standing rule, a long-term goal): something still true next month. Not for events, progress or what happened today ("we started X today", "finished Y"): use memory_note for those. Write one short sentence.'
+        : 'Saves a durable fact about the user to memory (preference, context, goal). Use when the user says "remember" or shares a lasting fact. Write one short sentence.', { text: { type: 'string' } }, ['text']),
       fn('memory_forget', 'Deletes a memory entry by id.', { id: { type: 'string' } }, ['id'])
     );
+    if (memorySearchEnabled) {
+      defs.push(
+        fn('memory_search', 'Searches long-term memory: MEMORY.md, USER.md, SOUL.md and the daily notes (memory/YYYY-MM-DD.md), by keywords and, when set up, by meaning. Use it when the user refers to something from earlier days, a past decision or a fact that is not in the memory list above. Returns file paths with line ranges and the matching text.', {
+          query: { type: 'string', description: 'What to look for, in a few words' },
+          limit: { type: 'number', description: 'Max results (default 6, max 20)' }
+        }, ['query']),
+        fn('memory_get', 'Reads lines of a memory file (path from memory_search, e.g. "memory/2026-10-24.md" or "USER.md").', {
+          path: { type: 'string' }, from: { type: 'number', description: 'First line (1-based, default 1)' }, lines: { type: 'number', description: 'How many lines (default 80, max 400)' }
+        }, ['path']),
+        fn('memory_note', "Adds a line to today's daily note (memory/YYYY-MM-DD.md): an event, decision, result or open item of today worth finding again on another day. Use it when the user asks to note, log or write down what happened (\"bugün X etdik, qeyd et\", \"note that we shipped Y\"). Not for lasting facts about the user (memory_save) and not for the plan of the current task (task_note).", {
+          text: { type: 'string', description: 'One or two short sentences' }
+        }, ['text'])
+      );
+    }
   }
   if (webEnabled) {
     defs.push(
@@ -205,7 +231,7 @@ function definitions({ makeEnabled, hasFolder, memoryEnabled, webEnabled, shellE
       fn('browser_type', 'Types text like a keyboard. With ref the element is clicked first to focus it; without ref it types into the focused element. clear empties the field first; submit presses Enter afterwards.', {
         text: { type: 'string' }, ref: { type: 'string' }, clear: { type: 'boolean' }, submit: { type: 'boolean' }, ...tab
       }, ['text']),
-      fn('browser_form_input', 'Sets the value of a form field directly: an option of a select (by value or visible text), a checkbox or radio (true/false), or the text of an input/textarea. Fires input and change events.', {
+      fn('browser_form_input', 'Sets the value of a form field directly: an option of a select (by value or visible text), a checkbox or radio (true/false), the text of an input/textarea, or the whole text of a rich editor (a post or note composer, shown as textbox "editor: …"). Fires input and change events. Prefer it over browser_type for long text.', {
         ref: { type: 'string' }, value: { description: 'Text, option, or true/false' }, ...tab
       }, ['ref', 'value']),
       fn('browser_key', 'Presses keys in the page: one or several separated by spaces, e.g. "Enter", "Tab Tab", "Escape", "ArrowDown", "cmd+a", "shift+Tab".', { keys: { type: 'string' }, ...tab }, ['keys']),
@@ -278,11 +304,13 @@ function definitions({ makeEnabled, hasFolder, memoryEnabled, webEnabled, shellE
       fn('schedule_task', 'Creates a scheduled task: a prompt that Artemis runs by itself later or on a repeat (shown in the Scheduled page). Use it when the user asks to do something at a time, every day/week, or "remind me". Each run starts a fresh chat with the prompt, so the prompt must be complete and self-contained. Requires approval.', {
         name: { type: 'string', description: 'Short name, e.g. "Morning news summary"' },
         prompt: { type: 'string', description: 'Exactly what to do on each run, complete and self-contained. An instruction to the assistant, unless reminder is true.' },
-        repeat: { type: 'string', enum: ['once', 'interval', 'daily', 'weekdays', 'weekly', 'monthly'] },
-        at: { type: 'string', description: 'Time of day HH:MM (24h, the user\'s local time). Not used for interval.' },
+        repeat: { type: 'string', enum: ['once', 'interval', 'custom', 'daily', 'weekdays', 'weekly', 'monthly'], description: 'custom = every N minutes, only between two times of day and/or only on some weekdays (e.g. every 30 min from 09:00 to 18:00 on weekdays)' },
+        at: { type: 'string', description: 'Time of day HH:MM (24h, the user\'s local time). Not used for interval or custom.' },
+        from: { type: 'string', description: 'For custom: start of the daily window HH:MM (optional)' },
+        to: { type: 'string', description: 'For custom: end of the daily window HH:MM (optional; may be earlier than from to run past midnight)' },
         date: { type: 'string', description: 'For once: the date YYYY-MM-DD' },
-        every_minutes: { type: 'integer', description: 'For interval: minutes between runs (minimum 5)' },
-        days: { type: 'array', items: { type: 'integer' }, description: 'For weekly: weekdays, 0=Sunday … 6=Saturday' },
+        every_minutes: { type: 'integer', description: 'For interval and custom: minutes between runs (minimum 5)' },
+        days: { type: 'array', items: { type: 'integer' }, description: 'For weekly and custom: weekdays, 0=Sunday … 6=Saturday' },
         day_of_month: { type: 'integer', description: 'For monthly: 1-31' },
         reminder: { type: 'boolean', description: 'Set true for a plain reminder. Then prompt is the exact message shown to the user, written to them (for example "Time to drink a glass of water!"), and no AI runs. Use this whenever the user only wants to be reminded of something.' },
         notify_phone: { type: 'boolean', description: 'Send the result to the user\'s phone (Telegram) after every run. Set true whenever the user says to send, notify or message them on their phone or Telegram.' },
@@ -293,16 +321,69 @@ function definitions({ makeEnabled, hasFolder, memoryEnabled, webEnabled, shellE
         id: { type: 'string', description: 'Id of the task, from list_schedules' },
         name: { type: 'string' },
         prompt: { type: 'string', description: 'New text (an instruction for the assistant, or the exact message when reminder is true)' },
-        repeat: { type: 'string', enum: ['once', 'interval', 'daily', 'weekdays', 'weekly', 'monthly'] },
+        repeat: { type: 'string', enum: ['once', 'interval', 'custom', 'daily', 'weekdays', 'weekly', 'monthly'] },
         at: { type: 'string', description: 'Time of day HH:MM (24h, local time)' },
+        from: { type: 'string', description: 'For custom: start of the daily window HH:MM' },
+        to: { type: 'string', description: 'For custom: end of the daily window HH:MM' },
         date: { type: 'string', description: 'For once: the date YYYY-MM-DD' },
-        every_minutes: { type: 'integer', description: 'For interval: minutes between runs (minimum 5)' },
-        days: { type: 'array', items: { type: 'integer' }, description: 'For weekly: weekdays, 0=Sunday … 6=Saturday' },
+        every_minutes: { type: 'integer', description: 'For interval and custom: minutes between runs (minimum 5)' },
+        days: { type: 'array', items: { type: 'integer' }, description: 'For weekly and custom: weekdays, 0=Sunday … 6=Saturday' },
         day_of_month: { type: 'integer', description: 'For monthly: 1-31' },
         reminder: { type: 'boolean' }, notify_phone: { type: 'boolean' }, allow_edits: { type: 'boolean' },
         enabled: { type: 'boolean', description: 'false pauses the task, true resumes it' }
       }, ['id']),
-      fn('delete_schedule', 'Deletes a scheduled task by id (from list_schedules). Requires approval.', { id: { type: 'string' } }, ['id'])
+      fn('delete_schedule', 'Deletes a scheduled task by id (from list_schedules). Requires approval.', { id: { type: 'string' } }, ['id']),
+      fn('hook_create', 'Creates (or, with id, changes) a webhook: an address that an outside service (GitHub, Stripe, a form, n8n, Zapier…) calls when something happens; Artemis then follows the instructions by itself and tells the user. Returns the URL and the secret to enter in that service. Requires approval.', {
+        id: { type: 'string', description: 'Only to change an existing webhook (from hook_list)' },
+        name: { type: 'string', description: 'Short name, a-z 0-9 and -, becomes part of the URL, e.g. "github-issues"' },
+        instructions: { type: 'string', description: 'What to do with each event, complete and self-contained, e.g. "Summarise the new issue in two lines and send it to me."' },
+        verify: { type: 'string', enum: ['token', 'github', 'stripe'], description: 'How callers are checked: github (signature, for GitHub webhooks), stripe (Stripe signing secret), token (any other service: a secret in the Authorization header or ?token=)' },
+        secret: { type: 'string', description: 'Only for stripe: the whsec_… signing secret the user copied from Stripe. Leave empty otherwise: a secret is made.' },
+        events: { type: 'array', items: { type: 'string' }, description: 'Only these events start a run, e.g. ["issues.opened", "pull_request"] for GitHub or ["invoice.paid"] for Stripe. Empty = all.' },
+        notify_phone: { type: 'boolean', description: 'Also send the result to Telegram (default true)' },
+        per_hour: { type: 'integer', description: 'At most this many events per hour (default 20)' }
+      }, ['name', 'instructions']),
+      fn('hook_list', 'Lists the webhooks with their URLs, checks, filters and last runs.', {}),
+      fn('hook_delete', 'Deletes a webhook by id (from hook_list). Its URL stops working. Requires approval.', { id: { type: 'string' } }, ['id']),
+      fn('heartbeat_get', 'Lists the heartbeats (id, name, on/off, how often, hours, checklist, last result). A heartbeat is a short checklist Artemis checks every few minutes, silent unless something needs the user.', {}),
+      fn('heartbeat_set', 'Creates or changes a heartbeat: a checklist Artemis checks every few minutes, telling the user (Telegram) only when something needs them. Use it when the user wants something watched continuously ("keep an eye on…", "tell me if…") rather than at fixed times. Several heartbeats can run, each with its own interval and hours: make a new one (no id) for a separate subject with a different interval, change one by id (from heartbeat_get). Each check is one model call, so keep checklists short and intervals as long as the user accepts. Requires approval.', {
+        id: { type: 'string', description: 'Id of the heartbeat to change (from heartbeat_get). Leave empty to create a new one.' },
+        name: { type: 'string', description: 'Short name, e.g. "Inbox" or "Site uptime" (required for a new one)' },
+        checklist: { type: 'string', description: 'The whole checklist: one "- " line per item. When changing one, read heartbeat_get first and keep the items the user still wants.' },
+        enabled: { type: 'boolean' },
+        every_minutes: { type: 'integer', description: 'Minutes between checks (2-1440, default 30)' },
+        active_from: { type: 'string', description: 'HH:MM, start of the active hours (local time); leave both empty for day and night' },
+        active_to: { type: 'string', description: 'HH:MM, end of the active hours' },
+        notify_phone: { type: 'boolean', description: 'Send alerts to Telegram (default true)' }
+      }, []),
+      fn('heartbeat_delete', 'Deletes a heartbeat by id (from heartbeat_get). Requires approval.', { id: { type: 'string' } }, ['id'])
+    );
+  }
+  if (teamsEnabled) {
+    const GROUPS_DESC = 'Tool groups: read, write, web, chats, make, browser, connectors, shell, phone, memory, automation';
+    defs.push(
+      fn('agent_list', 'Lists the user\'s agents (name, role, tools, model) that can be helper agents or team members.', {}),
+      fn('agent_save', 'Creates or changes one of the user\'s agents (saved as a file; the same name changes it). Requires approval.', {
+        name: { type: 'string', description: 'Short first name, e.g. "Pip"' }, role: { type: 'string', description: 'Job title, e.g. "Publisher"' },
+        description: { type: 'string', description: 'One line: when to use this agent' }, instructions: { type: 'string', description: 'The agent\'s instructions, complete' },
+        tools: { type: 'array', items: { type: 'string' }, description: GROUPS_DESC }, model: { type: 'string', description: 'Model id (prov:<provider>:<model>), "cli:claude" for Claude Code or "cli:codex" for Codex on the user\'s own login, empty for the default' }
+      }, ['name', 'instructions']),
+      fn('team_list', 'Lists the agent teams with their goal, members, status, schedule and budget.', {}),
+      fn('team_save', 'Creates (no id) or changes (with id) an agent team: a goal, members from the user\'s agents, and how it runs. Members must exist: create them with agent_save first. Requires approval.', {
+        id: { type: 'string', description: 'Only to change an existing team (from team_list)' },
+        name: { type: 'string' }, goal: { type: 'string', description: 'What the team delivers, specific' },
+        members: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, model: { type: 'string', description: 'Optional model for this member' } }, required: ['name'] } },
+        mode: { type: 'string', enum: ['lead', 'pipeline', 'open'], description: 'lead: Artemis plans and hands out tasks; pipeline: tasks one after another; open: everyone at once' },
+        lead_model: { type: 'string' }, rules: { type: 'string', description: 'Team rules added to every prompt (voice, audience, format)' },
+        reviewer: { type: 'string', description: 'Member who checks every finished task and sends work back until it is right (empty string = nobody)' },
+        project: { type: 'string', description: 'Project the team works for (name or id; empty string to unlink). The team then works in its folder, follows its instructions and can use its agents.' },
+        folder: { type: 'string', description: 'Absolute folder for the team\'s files, only when it should differ from the project\'s (empty string = the project\'s folder, or the Files folder)' },
+        budget_usd: { type: 'number' }, budget_tokens: { type: 'integer' }, minutes: { type: 'integer', description: 'Time limit per run' },
+        ask_first: { type: 'boolean', description: 'Ask the user before acting (default true)' }, can_hire: { type: 'boolean', description: 'The lead may add agents' },
+        repeat: { type: 'object', description: 'Start a new run by itself: {type:"daily"|"weekdays", at:"HH:MM"} or {type:"interval", every: minutes}. Omit or null for only by hand.', properties: { type: { type: 'string', enum: ['daily', 'weekdays', 'interval'] }, at: { type: 'string' }, every: { type: 'integer' } } }
+      }, ['name', 'goal', 'members']),
+      fn('team_start', 'Starts a new run of a team now (by id or name). Requires approval.', { id: { type: 'string' } }, ['id']),
+      fn('team_delete', 'Deletes a team and its room (by id). Requires approval.', { id: { type: 'string' } }, ['id'])
     );
   }
   if (phoneEnabled) {
@@ -545,9 +626,17 @@ function summarize(name, args) {
     case 'use_connector': return 'Switch on the connector ' + String(args.name || '');
     case 'lock_app': return 'Lock Artemis';
     case 'get_location': return 'Look up your approximate location from your IP address (one request to ipwho.is)';
-    case 'schedule_task': return `Schedule "${args.name}": ${args.repeat}${args.date ? ' ' + args.date : ''}${args.at ? ' at ' + args.at : ''}${args.every_minutes ? ' every ' + args.every_minutes + ' min' : ''}`;
+    case 'schedule_task': return `Schedule "${args.name}": ${args.repeat}${args.from && args.to ? ` ${args.from}-${args.to}` : ''}${args.date ? ' ' + args.date : ''}${args.at ? ' at ' + args.at : ''}${args.every_minutes ? ' every ' + args.every_minutes + ' min' : ''}`;
     case 'update_schedule': { const f = Object.keys(args).filter((k) => k !== 'id'); return `Change scheduled task ${args.id}${args.name ? ` ("${args.name}")` : ''}${f.length ? ': ' + f.join(', ') : ''}${args.enabled === false ? ' (pause)' : ''}`; }
     case 'delete_schedule': return `Delete scheduled task ${args.id} (permanent)`;
+    case 'hook_create': return `${args.id ? 'Change' : 'Create'} webhook "${args.name}" (${args.verify || 'token'}${Array.isArray(args.events) && args.events.length ? ', events: ' + args.events.join(', ') : ''}): an outside service can then start runs that do: ${String(args.instructions || '').slice(0, 160)}`;
+    case 'hook_delete': return `Delete webhook ${args.id}`;
+    case 'agent_save': return `Save agent "${args.name}"${args.role ? ` (${args.role})` : ''}${Array.isArray(args.tools) && args.tools.length ? ' · tools: ' + args.tools.join(', ') : ''}`;
+    case 'team_save': return `${args.id ? 'Change' : 'Create'} team "${args.name}" · ${(args.members || []).map((m) => m.name).join(', ')}${args.repeat && args.repeat.type ? ` · runs ${args.repeat.type === 'interval' ? `every ${Math.round((args.repeat.every || 60) / 60)} h` : `${args.repeat.type} at ${args.repeat.at || '09:00'}`}` : ''}${args.ask_first === false ? ' · acts without asking' : ''}`;
+    case 'team_start': return `Start a run of team ${args.id}`;
+    case 'team_delete': return `Delete team ${args.id}`;
+    case 'heartbeat_set': { const p = []; if (args.enabled !== undefined) p.push(args.enabled ? 'switch on' : 'switch off'); if (args.every_minutes) p.push(`every ${args.every_minutes} min`); if (args.active_from || args.active_to) p.push(`${args.active_from || '…'}-${args.active_to || '…'}`); if (typeof args.checklist === 'string') p.push(`checklist with ${args.checklist.split('\n').filter((l) => /^\s*-/.test(l)).length} items`); return `${args.id ? 'Change heartbeat ' + (args.name ? `"${args.name}"` : args.id) : `New heartbeat "${args.name || ''}"`}: ` + (p.join(', ') || 'no change'); }
+    case 'heartbeat_delete': return `Delete heartbeat ${args.id}`;
     case 'write_file': return `Write ${args.path} (${(args.content || '').length} characters)`;
     case 'edit_file': return `Edit ${args.path}`;
     case 'write_spreadsheet': return `Create spreadsheet ${args.path}`;
@@ -580,6 +669,9 @@ function summarize(name, args) {
     case 'create_skill': return `Save new skill: ${args.name || ''}`;
     case 'update_skill': return `Update skill: ${args.name || ''}`;
     case 'search_chats': return `Search chats: ${args.query || ''}`;
+    case 'memory_search': return `Search memory: ${args.query || ''}`;
+    case 'memory_get': return `Read memory file ${args.path || ''}`;
+    case 'memory_note': return `Daily note: ${String(args.text || '').slice(0, 120)}`;
     case 'make_create_scenario': return `Make: create scenario "${(args.template && args.template.name) || (args.blueprint && args.blueprint.name) || ''}" (${args.template ? 'HTTP request template' : (args.blueprint && args.blueprint.flow || []).length + ' modules'}${args.activate ? ', then turn on' : ''}, team ${args.teamId})`;
     case 'make_update_scenario': return `Make: update scenario ${args.id}${args.name ? ` (rename to "${args.name}")` : ''}${args.blueprint ? ' (new blueprint)' : ''}${args.scheduling ? ' (new schedule)' : ''}`;
     case 'make_set_active': return `Make: turn scenario ${args.id} ${args.active ? 'ON' : 'OFF'}`;
@@ -725,6 +817,10 @@ async function runTool(name, args, ctx) {
   try {
     const early = precheck(name, args, ctx, resolveSafe);
     if (early) return { ok: false, text: `Error: ${early}` };
+    if (ASK_EACH_TIME.has(name) && !ctx.autoAll) {
+      const ok = await ctx.approve({ name, args, summary: summarize(name, args) });
+      if (!ok) return { ok: true, denied: true, text: 'The user declined this action. Ask what they want before continuing.' };
+    }
     if (WRITE_TOOLS.has(name)) {
       const need = ALWAYS_ASK.has(name) || !ctx.autoApprove;
       if (need) {
@@ -950,6 +1046,26 @@ async function runTool(name, args, ctx) {
         if (memoryBudget(ctx)) return { ok: false, text: memoryBudget(ctx) };
         return { ok: true, text: ctx.memory.remove(String(args.id)) ? 'Removed from memory.' : 'No entry with this id.' };
       }
+      case 'memory_search': {
+        if (!ctx.memory || !ctx.memory.search) throw new Error('Memory search is off');
+        const q = String(args.query || '').trim();
+        if (!q) throw new Error('query is empty');
+        const hits = await ctx.memory.search(q, Math.min(20, Math.max(1, Number(args.limit) || 6)), ctx.signal);
+        return { ok: true, text: hits.length ? hits.map((h) => `${h.path}:${h.from}-${h.to}\n${h.text}`).join('\n\n---\n\n') : 'Nothing in memory matches. Do not guess; say you do not have it.' };
+      }
+      case 'memory_get': {
+        if (!ctx.memory || !ctx.memory.get) throw new Error('Memory search is off');
+        const r = ctx.memory.get(String(args.path || ''), args.from, args.lines);
+        return { ok: true, text: `${r.path} lines ${r.from}-${r.to} of ${r.total}:\n${r.text}` };
+      }
+      case 'memory_note': {
+        if (!ctx.memory || !ctx.memory.note) throw new Error('Memory search is off');
+        const text = String(args.text || '').trim();
+        if (!text) throw new Error('text is empty');
+        if (memoryBudget(ctx)) return { ok: false, text: memoryBudget(ctx) };
+        const where = ctx.memory.note(text.slice(0, 1000));
+        return { ok: true, text: `Added to ${where}.` };
+      }
       case 'use_skill': {
         if (!ctx.skills) throw new Error('Skills are off');
         const sk = ctx.skills.get(String(args.name || ''), root);
@@ -1041,6 +1157,7 @@ async function runTool(name, args, ctx) {
       case 'web_fetch':
         return { ok: true, text: await web.webFetch(String(args.url || ''), { signal: ctx.signal, allowPrivate: !!ctx.allowPrivateFetch }) };
       case 'run_command':
+        if (ctx.sandbox) return await ctx.sandbox.runCommand(args, { signal: ctx.signal, defaultCwd: root || undefined });
         return await shell.runCommand(args, { signal: ctx.signal, defaultCwd: root || undefined });
       case 'computer': {
         const sole = !(Array.isArray(args.actions) && args.actions.length);
@@ -1185,10 +1302,15 @@ async function runTool(name, args, ctx) {
         const type = String(args.repeat || '');
         const repeat = { type, at: args.at || '09:00' };
         if (type === 'once') repeat.date = String(args.date || '');
-        if (type === 'interval') repeat.every = Number(args.every_minutes) || 60;
-        if (type === 'weekly') repeat.days = Array.isArray(args.days) ? args.days.map(Number) : [];
+        if (type === 'interval' || type === 'custom') repeat.every = Number(args.every_minutes) || 60;
+        if (type === 'weekly' || (type === 'custom' && Array.isArray(args.days))) repeat.days = Array.isArray(args.days) ? args.days.map(Number) : [];
+        if (type === 'custom' && args.from && args.to) { repeat.from = String(args.from); repeat.to = String(args.to); }
         if (type === 'monthly') repeat.dayOfMonth = Number(args.day_of_month) || 1;
-        const job = ctx.schedule.save({ name: args.name, prompt: args.prompt, repeat, notifyPhone: !!args.notify_phone, reminder: !!args.reminder, allowEdits: !!args.allow_edits });
+        // "reminder" delivers the text as it is, with no AI. A text written as an instruction to the assistant ("Send the user a summary of today's notes")
+        // needs a run, or the user gets the instruction itself.
+        let reminder = !!args.reminder;
+        if (reminder && /\b(the user|user's|summar|xülasə|today's notes|daily note|memory\/|search|look up|check (the|my|if)|find out)/i.test(String(args.prompt || ''))) reminder = false;
+        const job = ctx.schedule.save({ name: args.name, prompt: args.prompt, repeat, notifyPhone: !!args.notify_phone, reminder, allowEdits: !!args.allow_edits });
         const phoneWarn = args.notify_phone && !ctx.phone ? ' Warning: Telegram is not connected and paired, so the result will not reach the phone until the user connects it in Settings → Phone. Tell the user.' : '';
         return { ok: true, text: `Scheduled "${job.name}" (id ${job.id}). It runs: ${ctx.schedule.list().find((j) => j.id === job.id)?.description || type}. Next run: ${job.nextRun ? new Date(job.nextRun).toLocaleString() : 'none'}.${phoneWarn}` };
       }
@@ -1203,6 +1325,8 @@ async function runTool(name, args, ctx) {
         if (args.every_minutes) rep.every = Number(args.every_minutes) || 60;
         if (Array.isArray(args.days)) rep.days = args.days.map(Number);
         if (args.day_of_month) rep.dayOfMonth = Number(args.day_of_month) || 1;
+        if (args.from !== undefined) rep.from = String(args.from || '');
+        if (args.to !== undefined) rep.to = String(args.to || '');
         const has = (k) => args[k] !== undefined && args[k] !== null;
         const job = ctx.schedule.save({
           id: old.id, name: has('name') ? args.name : old.name, prompt: has('prompt') ? args.prompt : old.prompt, projectId: old.projectId, model: old.model, repeat: rep,
@@ -1210,6 +1334,103 @@ async function runTool(name, args, ctx) {
           notifyPhone: has('notify_phone') ? !!args.notify_phone : old.notifyPhone, reminder: has('reminder') ? !!args.reminder : !!old.reminder
         });
         return { ok: true, text: `Updated "${job.name}" (id ${job.id}). It runs: ${ctx.schedule.list().find((j) => j.id === job.id)?.description || rep.type}. Next run: ${job.nextRun ? new Date(job.nextRun).toLocaleString() : 'none'}.` };
+      }
+      case 'hook_create': {
+        if (!ctx.schedule || !ctx.schedule.hooks) throw new Error('Webhooks are not available here.');
+        const old = args.id ? ctx.schedule.hooks.list().find((h) => h.id === String(args.id)) : null;
+        if (args.id && !old) throw new Error('No webhook with that id. Use hook_list.');
+        const h = ctx.schedule.hooks.save({ ...(old || {}), id: old ? old.id : undefined, name: args.name, instructions: args.instructions, verify: args.verify || (old && old.verify) || 'token', secret: args.secret || (old && (args.verify || old.verify) === old.verify ? old.secret : ''), events: Array.isArray(args.events) ? args.events : old ? old.events : [], notifyPhone: args.notify_phone !== undefined ? !!args.notify_phone : old ? old.notifyPhone : true, perHour: args.per_hour || (old && old.perHour) || 20 });
+        const info = ctx.schedule.hooks.info();
+        const how = h.verify === 'github' ? `In GitHub: repository → Settings → Webhooks → Add webhook. Payload URL: the URL below, Content type: application/json, Secret: ${h.secret}${h.events.length ? `, events: ${h.events.map((e) => e.split('.')[0]).filter((x, i, a) => a.indexOf(x) === i).join(', ')}` : ''}.`
+          : h.verify === 'stripe' ? 'In Stripe: Developers → Webhooks → Add endpoint with the URL below; the signing secret is already saved.'
+          : `Callers send the secret as "Authorization: Bearer ${h.secret}" (or add ?token=${h.secret} to the URL).`;
+        const reach = h.urls.public ? `Public URL: ${h.urls.public}` : `Local URL: ${h.urls.local}. It only works on this computer: for a service on the internet, the user switches on the tunnel in Scheduled → Webhooks (needs cloudflared) and uses the public URL shown there.`;
+        return { ok: true, text: `Webhook "${h.name}" ${old ? 'updated' : 'created'} (id ${h.id}). ${reach}\n${how}\nVerify: ${h.verify}. Events: ${h.events.length ? h.events.join(', ') : 'all'}. At most ${h.perHour} per hour.${info && info.running === false && info.error ? ' Warning: ' + info.error : ''} Tell the user the URL and the secret and where to paste them.` };
+      }
+      case 'agent_list': {
+        if (!ctx.teams) throw new Error('Agents and teams are not available here.');
+        const l = ctx.teams.agents();
+        return { ok: true, text: l.map((a) => `${a.name}${a.role ? ` (${a.role})` : ''} · tools: ${(a.tools || []).join(', ') || 'none'}${a.model ? ' · model ' + a.model : ''}${a.builtin ? ' · built-in' : ''}\n  ${a.description || ''}`).join('\n') || 'No agents.' };
+      }
+      case 'agent_save': {
+        if (!ctx.teams) throw new Error('Agents and teams are not available here.');
+        const r = ctx.teams.saveAgent({ name: args.name, role: args.role || '', description: args.description || args.role || '', body: args.instructions, tools: Array.isArray(args.tools) ? args.tools : ['read', 'web'], model: modelId(args.model) });
+        if (!r || !r.ok) throw new Error((r && r.error) || 'Could not save the agent.');
+        return { ok: true, text: `Agent "${r.name}" saved.` };
+      }
+      case 'team_list': {
+        if (!ctx.teams) throw new Error('Agents and teams are not available here.');
+        const l = await ctx.teams.list();
+        return { ok: true, text: l.map((t) => `${t.id} · "${t.name}" · ${t.run ? t.run.status : 'idle'} · members: ${t.members.map((m) => m.name).join(', ')}${t.projectId && ctx.teams.projects ? ((p) => (p ? ` · project: ${p.name}` : ''))(ctx.teams.projects().find((x) => x.id === t.projectId)) : ''}${t.repeat ? ` · runs ${t.repeat.type}${t.repeat.at ? ' ' + t.repeat.at : ''}` : ''}\n  goal: ${String(t.goal).slice(0, 200)}`).join('\n') || 'No teams.' };
+      }
+      case 'team_save': {
+        if (!ctx.teams) throw new Error('Agents and teams are not available here.');
+        const old = args.id ? await ctx.teams.get(String(args.id)) : null;
+        if (args.id && !old) throw new Error('No team with that id. Use team_list.');
+        const def = { ...(old || {}), id: old ? old.id : undefined, name: args.name, goal: args.goal, members: (args.members || []).map((m) => ({ name: m.name, model: modelId(m.model) })),
+          mode: args.mode || (old && old.mode) || 'lead', leadModel: args.lead_model !== undefined ? args.lead_model : old ? old.leadModel : '',
+          rules: args.rules !== undefined ? args.rules : old ? old.rules : '', budgetUsd: args.budget_usd !== undefined ? args.budget_usd : old ? old.budgetUsd : 3,
+          budgetTokens: args.budget_tokens !== undefined ? args.budget_tokens : old ? old.budgetTokens : 0, minutes: args.minutes !== undefined ? args.minutes : old ? old.minutes : 30,
+          askWrites: args.ask_first !== undefined ? !!args.ask_first : old ? old.askWrites : true, canHire: args.can_hire !== undefined ? !!args.can_hire : old ? old.canHire : false,
+          repeat: args.repeat !== undefined ? args.repeat : old ? old.repeat : null };
+        if (args.project !== undefined) {
+          const q = String(args.project || '').trim().toLowerCase();
+          if (!q) def.projectId = '';
+          else {
+            const ps = ctx.teams.projects ? ctx.teams.projects() : [];
+            const p = ps.find((x) => x.id === args.project || String(x.name).toLowerCase() === q) || ps.find((x) => String(x.name).toLowerCase().includes(q));
+            if (!p) throw new Error(`No project "${args.project}". Projects: ${ps.map((x) => `"${x.name}"`).join(', ') || 'none yet (the user creates them in Projects)'}.`);
+            def.projectId = p.id;
+          }
+        }
+        if (args.folder !== undefined) def.folder = String(args.folder || '').trim();
+        if (args.reviewer !== undefined) def.reviewer = String(args.reviewer || '').trim();
+        const proj = def.projectId && ctx.teams.projects ? ctx.teams.projects().find((x) => x.id === def.projectId) : null;
+        const missing = def.members.filter((m) => !ctx.teams.agents(proj ? proj.folder : null).some((a) => a.name.toLowerCase() === String(m.name).toLowerCase())).map((m) => m.name);
+        if (missing.length) throw new Error(`These agents do not exist yet: ${missing.join(', ')}. Create them with agent_save first.`);
+        const t = await ctx.teams.save(def);
+        return { ok: true, text: `Team "${t.name}" ${old ? 'changed' : 'created'} (id ${t.id}) with ${t.members.map((m) => m.name).join(', ')}.${t.reviewer ? ` ${t.reviewer} reviews every finished task.` : ''}${proj ? ` It works for the project "${proj.name}".` : ''}${t.repeat ? ' It starts by itself: ' + (t.repeat.type === 'interval' ? `every ${Math.round((t.repeat.every || 60) / 60)} h` : `${t.repeat.type} at ${t.repeat.at || '09:00'}`) + '.' : ''} The user finds it on the Agents page.` };
+      }
+      case 'team_start': {
+        if (!ctx.teams) throw new Error('Agents and teams are not available here.');
+        const t = await ctx.teams.get(String(args.id));
+        if (!t) throw new Error('No team with that id or name. Use team_list.');
+        await ctx.teams.start(t.id);
+        return { ok: true, text: `Team "${t.name}" started. Its room is on the Agents page.` };
+      }
+      case 'team_delete': {
+        if (!ctx.teams) throw new Error('Agents and teams are not available here.');
+        await ctx.teams.remove(String(args.id));
+        return { ok: true, text: 'Team deleted.' };
+      }
+      case 'hook_list': {
+        if (!ctx.schedule || !ctx.schedule.hooks) throw new Error('Webhooks are not available here.');
+        const l = ctx.schedule.hooks.list();
+        return { ok: true, text: l.length ? l.map((h) => `${h.id} · ${h.name}${h.enabled === false ? ' (off)' : ''} · ${h.verify} · ${h.urls.public || h.urls.local} · events: ${(h.events || []).join(', ') || 'all'} · ${h.runs || 0} runs${h.lastStatus ? ' · last: ' + h.lastStatus : ''}\n  ${String(h.instructions).slice(0, 200)}`).join('\n') : 'No webhooks.' };
+      }
+      case 'hook_delete': {
+        if (!ctx.schedule || !ctx.schedule.hooks) throw new Error('Webhooks are not available here.');
+        if (!ctx.schedule.hooks.list().some((h) => h.id === String(args.id))) throw new Error('No webhook with that id. Use hook_list.');
+        ctx.schedule.hooks.remove(String(args.id));
+        return { ok: true, text: 'Webhook deleted. Its URL no longer works; remove it in the other service too.' };
+      }
+      case 'heartbeat_get': {
+        if (!ctx.schedule || !ctx.schedule.heartbeat) throw new Error('Heartbeats are not available here.');
+        const l = ctx.schedule.heartbeat.list();
+        if (!l.length) return { ok: true, text: 'No heartbeats.' };
+        return { ok: true, text: l.map((h) => `${h.id} · "${h.name}" · ${h.enabled ? 'on' : 'off'} · every ${h.every} min · ${h.from && h.to && h.from !== h.to ? `${h.from}-${h.to}` : 'day and night'}${h.nextAt ? ' · next ' + new Date(h.nextAt).toLocaleString() : ''} · last: ${h.lastStatus || 'never'}${h.lastError ? ' (' + h.lastError + ')' : ''}\n${require('./core/heartbeat').checklistText(h.checklist) || '(empty)'}`).join('\n\n') };
+      }
+      case 'heartbeat_set': {
+        if (!ctx.schedule || !ctx.schedule.heartbeat) throw new Error('Heartbeats are not available here.');
+        const h = ctx.schedule.heartbeat.save({ id: args.id ? String(args.id) : undefined, name: args.name, checklist: typeof args.checklist === 'string' ? args.checklist : undefined, enabled: args.enabled, every: args.every_minutes, from: args.active_from, to: args.active_to, phone: args.notify_phone });
+        const warn = h.enabled && !ctx.phone ? ' Telegram is not connected and paired, so alerts only appear as chats and notifications on this computer.' : '';
+        const perDay = Math.round((h.from && h.to && h.from !== h.to ? (((+h.to.slice(0, 2) * 60 + +h.to.slice(3)) - (+h.from.slice(0, 2) * 60 + +h.from.slice(3)) + 1440) % 1440 || 1440) : 1440) / h.every);
+        return { ok: true, text: `Heartbeat "${h.name}" (id ${h.id}) ${h.enabled ? 'on' : 'off'}, every ${h.every} min, ${h.from && h.to && h.from !== h.to ? `${h.from}-${h.to}` : 'day and night'} (about ${perDay} checks a day).${h.nextAt ? ' Next check ' + new Date(h.nextAt).toLocaleString() + '.' : ''}${warn}` };
+      }
+      case 'heartbeat_delete': {
+        if (!ctx.schedule || !ctx.schedule.heartbeat) throw new Error('Heartbeats are not available here.');
+        ctx.schedule.heartbeat.remove(String(args.id));
+        return { ok: true, text: 'Heartbeat deleted.' };
       }
       case 'delete_schedule': {
         if (!ctx.schedule) throw new Error('Scheduled tasks are not available here.');
@@ -1259,4 +1480,4 @@ async function runTool(name, args, ctx) {
   }
 }
 
-module.exports = { definitions, run, clip, resolveSafe, WRITE_TOOLS, SESSION_TOOLS, jobsOf, withLocks, lockKey, walk, browserApproval, summarize };
+module.exports = { definitions, run, clip, modelId, resolveSafe, WRITE_TOOLS, SESSION_TOOLS, jobsOf, withLocks, lockKey, walk, browserApproval, summarize };

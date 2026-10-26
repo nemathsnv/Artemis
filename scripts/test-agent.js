@@ -543,3 +543,76 @@ const delta = (d, finish = null) => ({ choices: [{ delta: d, finish_reason: fini
   srv.closeAllConnections?.(); srv.close();
   console.log('agent: thinking events ok');
 })().catch((e) => { console.error('FAILED:', e); process.exit(1); });
+
+// OpenAI gpt-6 on chat/completions takes function tools only with reasoning_effort 'none': keep the tools and send 'none'.
+(async () => {
+  const { runAgent } = require('../electron/agent');
+  const bodies = [];
+  const srv = http.createServer((q, r) => {
+    let raw = ''; q.on('data', (d) => (raw += d));
+    q.on('end', () => {
+      const b = JSON.parse(raw || '{}');
+      bodies.push(b);
+      if (b.tools && b.reasoning_effort !== 'none') {
+        r.writeHead(400, { 'content-type': 'application/json' });
+        return r.end(JSON.stringify({ error: { message: "Function tools with reasoning_effort are not supported for gpt-6-luna in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'." } }));
+      }
+      r.writeHead(200, { 'content-type': 'text/event-stream' });
+      const ev = (o) => 'data: ' + JSON.stringify(o) + '\n\n';
+      if (bodies.filter((x) => x.reasoning_effort === 'none').length === 1) {
+        r.write(ev({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'c1', type: 'function', function: { name: 'list_dir', arguments: '{}' } }] } }] }));
+        return r.end(ev({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] }) + 'data: [DONE]\n\n');
+      }
+      r.end(ev({ choices: [{ delta: { content: 'listed' }, finish_reason: 'stop' }] }) + 'data: [DONE]\n\n');
+    });
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-effort-'));
+  const evs = [];
+  await runAgent({ baseUrl: `http://127.0.0.1:${srv.address().port}`, key: 'k', model: 'gpt-6-luna', root, toolsEnabled: true, messages: [{ role: 'user', content: 'list' }], approve: async () => true, send: (e) => evs.push(e) });
+  assert.ok(!('reasoning_effort' in bodies[0]), 'nothing is sent until the endpoint asks');
+  assert.ok(bodies.slice(1).every((b) => b.reasoning_effort === 'none' && b.tools && b.tools.length), 'then every request keeps its tools with reasoning off');
+  assert.strictEqual(evs.filter((e) => e.type === 'tool:call').length, 1, 'the tool call went through');
+  assert.ok(!evs.some((e) => e.type === 'notice' && /Tools were rejected/.test(e.text)), 'tools were not switched off');
+  assert.ok(evs.some((e) => e.type === 'notice' && /reasoning off/.test(e.text)));
+  fs.rmSync(root, { recursive: true, force: true });
+  srv.closeAllConnections?.(); srv.close();
+  console.log('agent: tools with reasoning off ok');
+
+  {
+    // Claude Code / Codex as the chat model: no endpoint request; Artemis's tools are handed to the CLI (minus the ones
+    // the CLI has itself), run here with Artemis's approvals, and the CLI's steps become chat events
+    const root2 = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-cli-'));
+    const evs = []; let got = null;
+    const make = { list: async () => [{ id: 1, name: 'Daily' }] };
+    await runAgent({
+      baseUrl: '', key: '', model: 'cli:claude', toolsEnabled: true, root: root2, webEnabled: true, make, messages: [{ role: 'user', content: 'list my scenarios' }],
+      send: (e) => evs.push(e), approve: async () => true,
+      cli: { kind: 'claude', model: '', transcript: (h) => h.map((m) => m.content).join('|'), turn: async (o) => {
+        got = o;
+        o.onStep({ type: 'step' });
+        o.onStep({ type: 'tool', id: 'r1', name: 'read_file', args: { path: 'a' } });
+        o.onStep({ type: 'tool:done', id: 'r1', ok: true, text: 'file text' });
+        o.onStep({ type: 'step' });
+        o.onStep({ type: 'tool', id: 'm1', name: 'make_list_scenarios', args: {}, bridged: true });
+        const t = o.tools.find((x) => x.name === 'make_list_scenarios');
+        if (t) await t.run({}).catch(() => {});
+        o.onStep({ type: 'tool:done', id: 'm1', ok: true });
+        o.onStep({ type: 'step' }); o.onStep({ type: 'text', text: 'Here they are.' });
+        o.onUsage({ prompt: 10, completion: 5 });
+        return 'Here they are.';
+      } }
+    });
+    const names = got.tools.map((t) => t.name);
+    assert.ok(!names.includes('read_file') && !names.includes('run_command') && !names.includes('web_search'), 'tools the CLI has itself are not handed over');
+    assert.ok(names.some((n) => /^make_/.test(n)), 'Artemis-only tools are: ' + names.join(','));
+    assert.strictEqual(got.prompt, 'list my scenarios'); assert.strictEqual(got.perm, 'ask'); assert.strictEqual(got.folder, root2);
+    assert.ok(/Artemis/.test(got.system), 'the Artemis system prompt goes to the CLI');
+    assert.strictEqual(evs.filter((e) => e.type === 'tool:result' && e.id === 'r1').length, 1, 'the CLI\'s own step is shown');
+    assert.strictEqual(evs.filter((e) => e.type === 'step:new').length, 2);
+    assert.strictEqual(evs.filter((e) => e.type === 'chunk').map((e) => e.text).join(''), 'Here they are.');
+    if (names.includes('make_list_scenarios')) assert.strictEqual(evs.filter((e) => e.type === 'tool:result' && e.id === 'm1').length, 1, 'a bridged tool is shown once, with Artemis\'s own result');
+    fs.rmSync(root2, { recursive: true, force: true });
+    console.log('agent: Claude Code / Codex chat ok');
+  }
+})().catch((e) => { console.error('FAILED:', e); process.exit(1); });

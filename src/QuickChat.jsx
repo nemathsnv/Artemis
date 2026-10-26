@@ -1,8 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { applyTextSize, applyTheme, loadThemes } from './lib/themes.js';
+import { applyTextSize, applySettingsTheme, loadThemes } from './lib/themes.js';
 import Markdown from './components/Markdown.jsx';
 import ToolCard from './components/ToolCard.jsx';
 import { Icon } from './components/Icons.jsx';
+import Logo from './components/Logo.jsx';
 import { toApiMessages, uid } from './lib/history.js';
 import { AttachmentChip, Thinking, ThinkBlock, thinkMode } from './components/Message.jsx';
 import { addThinking, stepParts } from './lib/think.mjs';
@@ -48,6 +49,8 @@ export default function QuickChat({ embedded = false, onClose, onKeepOpen, focus
   const [nonce, setNonce] = useState(0);
   const [brains, setBrains] = useState([]);
   const [providers, setProviders] = useState([]);
+  const [clis, setClis] = useState({}); // Claude Code / Codex installed on this computer (plan-login chat models)
+  useEffect(() => { window.api.teamsClis?.().then((c) => c && setClis(c)).catch(() => {}); }, []);
   const lsGet = (k) => { try { return localStorage.getItem(k) || ''; } catch { return ''; } };
   const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch {} };
   const [picked, setPicked] = useState(() => { const v = lsGet('quick-brain'); return v ? (v === 'none' ? '' : v) : null; }); // null = not chosen here: the default brain from Settings
@@ -74,7 +77,7 @@ export default function QuickChat({ embedded = false, onClose, onKeepOpen, focus
     }
     document.documentElement.classList.add('quick');
     // the window lives on after the first open: repaint the theme every time it is shown, otherwise a theme changed in the main window never reaches it
-    const paint = (s) => { applyTextSize(s.textSize); document.documentElement.dataset.thinking = s.showThinking || 'collapsed'; return loadThemes(api).then((t) => applyTheme(s.theme, t)); };
+    const paint = (s) => { applyTextSize(s.textSize); document.documentElement.dataset.thinking = s.showThinking || 'collapsed'; return loadThemes(api).then((t) => applySettingsTheme(s, t)); };
     api.getSettings().then((s) => { setSettings(s); paint(s); });
     const offTheme = api.onThemeChanged ? api.onThemeChanged(() => { api.getSettings().then(paint); }) : undefined;
     const offShown = api.onQuickShown((o) => {
@@ -118,7 +121,7 @@ export default function QuickChat({ embedded = false, onClose, onKeepOpen, focus
     return () => window.removeEventListener('keydown', h);
   }, []);
 
-  const groups = modelGroups(modelPick || (settings && settings.model), providers);
+  const groups = modelGroups(modelPick || (settings && settings.model), providers, clis);
   const activeModel = modelPick || (settings ? defaultModel(settings, providers) : '');
   const send = () => {
     const t = text.trim();
@@ -182,7 +185,7 @@ export default function QuickChat({ embedded = false, onClose, onKeepOpen, focus
           onOpenChat={(id) => api.paletteRun({ kind: 'chat', id })} onOpenNote={(p) => api.paletteRun({ kind: 'note', path: p })} onOpenFile={(p) => api.paletteRun({ kind: 'file', path: p })} />
       ) : (<>
       <div className="quick-bar drag">
-        <Icon name="chat" size={18} className="quick-icon" />
+        <Logo size={26} className="quick-logo" />
         <textarea
           ref={inputRef} className="nodrag quick-input" rows={1} autoFocus value={text} onChange={(e) => setText(e.target.value)} onKeyDown={onKey} onPaste={onPaste}
           placeholder={settings.hasApiKey ? 'Ask anything…' : 'Add a provider in Settings first'}

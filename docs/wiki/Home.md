@@ -23,14 +23,17 @@ New here? Start with [Getting Started](Getting-Started.md).
 ## Agents and automation
 
 - [Sub-Agents](Sub-Agents.md): role agents that work in parallel, and how to write your own
+- [Agent Teams](Agent-Teams.md): several agents on one goal, running by themselves every day with Make, the browser and memory
 - [Brains](Brains.md): named personalities, each with its own model, and the council vote
 - [Skills](Skills.md): reusable `SKILL.md` instructions
 - [Scheduled Tasks](Scheduled-Tasks.md)
+- [Heartbeat and webhooks](Heartbeat-and-Webhooks.md): a background checklist, tasks limited to certain hours and days, events from GitHub, Stripe and others
 - [Make](Make.md): Make.com scenarios by asking
 
 ## Tools and control
 
 - [Tools and Approvals](Tools-and-Approvals.md): what each tool group does and when Artemis asks
+- [Advanced](Advanced.md): edit every prompt, and the command blocklist
 - [Terminal](Terminal.md)
 - [Browser](Browser.md)
 - [Computer Control](Computer-Control.md) (macOS)
@@ -40,6 +43,8 @@ New here? Start with [Getting Started](Getting-Started.md).
 - [Sentinel Voice](Sentinel-Voice.md): wake word, push-to-talk, the floating widget
 - [Phone (Telegram)](Phone-Telegram.md)
 - [MCP](MCP.md): connectors, and Artemis as an MCP server for Claude Code
+- [Gateway and command line](Gateway.md): the local API, `artemis` CLI and the headless mode
+- [Sandbox](Sandbox.md): terminal commands in Docker or over SSH
 
 ## Security and help
 
